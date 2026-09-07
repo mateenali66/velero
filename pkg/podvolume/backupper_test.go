@@ -29,6 +29,7 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -40,8 +41,60 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/builder"
 	"github.com/vmware-tanzu/velero/pkg/repository"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
-	"github.com/vmware-tanzu/velero/pkg/util/kube"
 )
+
+type fakeInformerRegistration struct{}
+
+func (fakeInformerRegistration) HasSynced() bool { return true }
+
+func (fakeInformerRegistration) HasSyncedChecker() cache.DoneChecker {
+	return fakeDoneChecker{name: "fakeInformerRegistration"}
+}
+
+type fakeDoneChecker struct {
+	name string
+}
+
+func (f fakeDoneChecker) Name() string { return f.name }
+
+func (f fakeDoneChecker) Done() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+type fakeInformer struct {
+	handler cache.ResourceEventHandler
+}
+
+func (f *fakeInformer) AddEventHandler(handler cache.ResourceEventHandler) (cache.ResourceEventHandlerRegistration, error) {
+	f.handler = handler
+	return fakeInformerRegistration{}, nil
+}
+
+func (f *fakeInformer) AddEventHandlerWithResyncPeriod(handler cache.ResourceEventHandler, _ time.Duration) (cache.ResourceEventHandlerRegistration, error) {
+	return f.AddEventHandler(handler)
+}
+
+func (f *fakeInformer) AddEventHandlerWithOptions(handler cache.ResourceEventHandler, _ cache.HandlerOptions) (cache.ResourceEventHandlerRegistration, error) {
+	return f.AddEventHandler(handler)
+}
+
+func (f *fakeInformer) RemoveEventHandler(_ cache.ResourceEventHandlerRegistration) error {
+	return nil
+}
+
+func (f *fakeInformer) AddIndexers(_ cache.Indexers) error { return nil }
+
+func (f *fakeInformer) HasSynced() bool { return true }
+
+func (f *fakeInformer) HasSyncedChecker() cache.DoneChecker {
+	return fakeDoneChecker{name: "fakeInformer"}
+}
+
+func (f *fakeInformer) IsStopped() bool { return false }
+
+var _ ctrlcache.Informer = (*fakeInformer)(nil)
 
 func TestIsHostPathVolume(t *testing.T) {
 	// hostPath pod volume
@@ -280,7 +333,8 @@ func createPVObj(index int, withHostPath bool) *corev1api.PersistentVolume {
 }
 
 func createPVCObj(index int) *corev1api.PersistentVolumeClaim {
-	pvcObj := builder.ForPersistentVolumeClaim("fake-ns", fmt.Sprintf("fake-pvc-%d", index)).VolumeName(fmt.Sprintf("fake-pv-%d", index)).Result()
+	pvcObj := builder.ForPersistentVolumeClaim("fake-ns", fmt.Sprintf("fake-pvc-%d", index)).VolumeName(fmt.Sprintf("fake-pv-%d", index)).
+		Phase(corev1api.ClaimBound).Result()
 	return pvcObj
 }
 
@@ -304,7 +358,7 @@ func createPVBObj(fail bool, withSnapshot bool, index int, uploaderType string) 
 }
 
 func createNodeObj() *corev1api.Node {
-	return builder.ForNode("fake-node-name").Labels(map[string]string{"kubernetes.io/os": "linux"}).Result()
+	return builder.ForNode("fake-node-name").Labels(map[string]string{corev1api.LabelOSStable: "linux"}).Result()
 }
 
 func TestBackupPodVolumes(t *testing.T) {
@@ -327,6 +381,8 @@ func TestBackupPodVolumes(t *testing.T) {
 		pvbs                  int
 		mockGetRepositoryType bool
 		errs                  []string
+		expectedBackedup      []string
+		expectedSkipped       map[string]string
 	}{
 		{
 			name: "empty volume list",
@@ -343,7 +399,7 @@ func TestBackupPodVolumes(t *testing.T) {
 			},
 			uploaderType: "fake-uploader-type",
 			errs: []string{
-				"invalid uploader type 'fake-uploader-type', valid type: 'kopia'",
+				"invalid uploader type 'fake-uploader-type', valid types: 'kopia', 'velero-block'",
 			},
 		},
 		{
@@ -520,6 +576,10 @@ func TestBackupPodVolumes(t *testing.T) {
 			uploaderType:  "kopia",
 			bsl:           "fake-bsl",
 			errs:          []string{},
+			expectedSkipped: map[string]string{
+				"fake-volume-1": "volume fake-volume-1 is declared in pod fake-ns/fake-pod but not mounted by any container, skipping",
+				"fake-volume-2": "volume fake-volume-2 is declared in pod fake-ns/fake-pod but not mounted by any container, skipping",
+			},
 		},
 		{
 			name: "return completed pvbs",
@@ -536,14 +596,14 @@ func TestBackupPodVolumes(t *testing.T) {
 			ctlClientObj: []runtime.Object{
 				createBackupRepoObj(),
 			},
-			runtimeScheme: scheme,
-			uploaderType:  "kopia",
-			bsl:           "fake-bsl",
-			pvbs:          1,
-			errs:          []string{},
+			runtimeScheme:    scheme,
+			uploaderType:     "kopia",
+			bsl:              "fake-bsl",
+			pvbs:             1,
+			errs:             []string{},
+			expectedBackedup: []string{"fake-volume-1"},
 		},
 	}
-	// TODO add more verification around PVCBackupSummary returned by "BackupPodVolumes"
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ctx := t.Context()
@@ -557,27 +617,16 @@ func TestBackupPodVolumes(t *testing.T) {
 			objList = append(objList, test.kubeClientObj...)
 			fakeCtrlClient := fakeClientBuilder.WithRuntimeObjects(objList...).Build()
 
-			fakeCRWatchClient := velerotest.NewFakeControllerRuntimeWatchClient(t, test.kubeClientObj...)
-			lw := kube.InternalLW{
-				Client:     fakeCRWatchClient,
-				Namespace:  velerov1api.DefaultNamespace,
-				ObjectList: new(velerov1api.PodVolumeBackupList),
-			}
-
-			pvbInformer := cache.NewSharedIndexInformer(&lw, &velerov1api.PodVolumeBackup{}, 0, cache.Indexers{})
-
-			go pvbInformer.Run(ctx.Done())
-			require.True(t, cache.WaitForCacheSync(ctx.Done(), pvbInformer.HasSynced))
+			// This test validates creation-time behavior only, so we don't need
+			// informer sync/watch to be running.
+			pvbInformer := cache.NewSharedIndexInformer(&cache.ListWatch{}, &velerov1api.PodVolumeBackup{}, 0, cache.Indexers{})
 
 			ensurer := repository.NewEnsurer(fakeCtrlClient, velerotest.NewLogger(), time.Millisecond)
 
 			backupObj := builder.ForBackup(velerov1api.DefaultNamespace, "fake-backup").Result()
 			backupObj.Spec.StorageLocation = test.bsl
 
-			factory := NewBackupperFactory(repository.NewRepoLocker(), ensurer, fakeCtrlClient, pvbInformer, velerotest.NewLogger())
-			bp, err := factory.NewBackupper(ctx, log, backupObj, test.uploaderType)
-
-			require.NoError(t, err)
+			bp := newBackupper(ctx, log, repository.NewRepoLocker(), ensurer, pvbInformer, fakeCtrlClient, test.uploaderType, backupObj)
 
 			if test.mockGetRepositoryType {
 				funcGetRepositoryType = func() string { return "" }
@@ -585,17 +634,31 @@ func TestBackupPodVolumes(t *testing.T) {
 				funcGetRepositoryType = getRepositoryType
 			}
 
-			pvbs, _, errs := bp.BackupPodVolumes(backupObj, test.sourcePod, test.volumes, nil, velerotest.NewLogger())
+			pvbs, summary, errs := bp.BackupPodVolumes(backupObj, test.sourcePod, test.volumes, nil, velerotest.NewLogger())
 
-			if test.errs == nil {
-				require.NoError(t, err)
-			} else {
+			if test.errs != nil {
 				for i := 0; i < len(errs); i++ {
 					require.EqualError(t, errs[i], test.errs[i])
 				}
 			}
 
 			assert.Len(t, pvbs, test.pvbs)
+
+			if summary != nil {
+				assert.Len(t, summary.Backedup, len(test.expectedBackedup))
+				for _, vol := range test.expectedBackedup {
+					assert.Contains(t, summary.Backedup, vol)
+				}
+
+				assert.Len(t, summary.Skipped, len(test.expectedSkipped))
+				for vol, reason := range test.expectedSkipped {
+					require.Contains(t, summary.Skipped, vol)
+					assert.Equal(t, reason, summary.Skipped[vol].Reason)
+				}
+			} else {
+				assert.Empty(t, test.expectedBackedup)
+				assert.Empty(t, test.expectedSkipped)
+			}
 		})
 	}
 }
@@ -693,14 +756,14 @@ func TestListPodVolumeBackupsByPodp(t *testing.T) {
 }
 
 type logHook struct {
-	entry *logrus.Entry
+	entries []*logrus.Entry
 }
 
 func (l *logHook) Levels() []logrus.Level {
 	return []logrus.Level{logrus.ErrorLevel}
 }
 func (l *logHook) Fire(entry *logrus.Entry) error {
-	l.entry = entry
+	l.entries = append(l.entries, entry)
 	return nil
 }
 
@@ -717,16 +780,18 @@ func TestWaitAllPodVolumesProcessed(t *testing.T) {
 		statusToBeUpdated *velerov1api.PodVolumeBackupStatus
 		expectedErr       string
 		expectedPVBPhase  velerov1api.PodVolumeBackupPhase
+		expectedPVBCount  int
 	}{
 		{
 			name: "contains no pvb should report no error",
 			ctx:  timeoutCtx,
 		},
 		{
-			name:        "context canceled",
-			ctx:         timeoutCtx,
-			pvb:         pvb,
-			expectedErr: "timed out waiting for all PodVolumeBackups to complete",
+			name:             "context canceled should still return tracked pvbs",
+			ctx:              timeoutCtx,
+			pvb:              pvb,
+			expectedErr:      "timed out waiting for all PodVolumeBackups to complete",
+			expectedPVBCount: 1,
 		},
 		{
 			name: "failed pvbs",
@@ -760,26 +825,39 @@ func TestWaitAllPodVolumesProcessed(t *testing.T) {
 		velerov1api.AddToScheme(scheme)
 		client := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 
-		lw := kube.InternalLW{
-			Client:     client,
-			Namespace:  velerov1api.DefaultNamespace,
-			ObjectList: new(velerov1api.PodVolumeBackupList),
-		}
-
-		informer := cache.NewSharedIndexInformer(&lw, &velerov1api.PodVolumeBackup{}, 0, cache.Indexers{})
-
-		ctx := t.Context()
-		go informer.Run(ctx.Done())
-		require.True(t, cache.WaitForCacheSync(ctx.Done(), informer.HasSynced))
+		informer := &fakeInformer{}
 
 		logger := logrus.New()
 		logHook := &logHook{}
 		logger.Hooks.Add(logHook)
 
-		backuper := newBackupper(c.ctx, log, nil, nil, informer, nil, "", &velerov1api.Backup{})
+		backuper := newBackupper(c.ctx, log, nil, nil, informer, client, "", &velerov1api.Backup{})
 		if c.pvb != nil {
 			require.NoError(t, backuper.pvbIndexer.Add(c.pvb))
 			backuper.wg.Add(1)
+		}
+
+		if c.ctx == timeoutCtx && c.pvb != nil {
+			// Start a goroutine to simulate the controller's cancellation behavior
+			go func() {
+				// Wait a short time for the cancel flag to be set
+				ticker := time.NewTicker(10 * time.Millisecond)
+				defer ticker.Stop()
+				for range ticker.C {
+					pvb := &velerov1api.PodVolumeBackup{}
+					err := client.Get(t.Context(), ctrlclient.ObjectKey{Namespace: c.pvb.Namespace, Name: c.pvb.Name}, pvb)
+					if err == nil && pvb.Spec.Cancel {
+						oldPVB := pvb.DeepCopy()
+						pvb.Status.Phase = velerov1api.PodVolumeBackupPhaseCanceled
+						pvb.Status.Message = "canceled"
+						_ = client.Update(t.Context(), pvb)
+						if informer.handler != nil {
+							informer.handler.OnUpdate(oldPVB, pvb)
+						}
+						return
+					}
+				}
+			}()
 		}
 
 		if c.statusToBeUpdated != nil {
@@ -787,17 +865,34 @@ func TestWaitAllPodVolumesProcessed(t *testing.T) {
 			err := client.Get(t.Context(), ctrlclient.ObjectKey{Namespace: c.pvb.Namespace, Name: c.pvb.Name}, pvb)
 			require.NoError(t, err)
 
+			oldPVB := pvb.DeepCopy()
 			pvb.Status = *c.statusToBeUpdated
 			err = client.Update(t.Context(), pvb)
 			require.NoError(t, err)
+
+			require.NotNil(t, informer.handler)
+			informer.handler.OnUpdate(oldPVB, pvb)
 		}
 
 		pvbs := backuper.WaitAllPodVolumesProcessed(logger)
 
 		if c.expectedErr != "" {
-			assert.Equal(t, c.expectedErr, logHook.entry.Message)
+			found := false
+			var loggedMsgs []string
+			for _, entry := range logHook.entries {
+				loggedMsgs = append(loggedMsgs, entry.Message)
+				if entry.Message == c.expectedErr {
+					found = true
+					break
+				}
+			}
+			assert.True(t, found, "Expected error %q to be logged, but got %v", c.expectedErr, loggedMsgs)
 		} else {
-			assert.Nil(t, logHook.entry)
+			assert.Empty(t, logHook.entries)
+		}
+
+		if c.expectedPVBCount > 0 {
+			require.Len(t, pvbs, c.expectedPVBCount)
 		}
 
 		if c.expectedPVBPhase != "" {

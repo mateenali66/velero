@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pkg/errors"
-	cron "github.com/robfig/cron/v3"
+	"github.com/cockroachdb/errors"
+	cron "github.com/netresearch/go-cron"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -111,7 +111,11 @@ func (c *scheduleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	original := schedule.DeepCopy()
 
 	if schedule.Spec.SkipImmediately == nil {
-		schedule.Spec.SkipImmediately = &c.skipImmediately
+		// Copy the value rather than aliasing &c.skipImmediately: c is a long-lived
+		// singleton reconciler, and the block below can write through this pointer,
+		// which would otherwise mutate the reconciler's shared default field.
+		skipImmediately := c.skipImmediately
+		schedule.Spec.SkipImmediately = &skipImmediately
 	}
 	if schedule.Spec.SkipImmediately != nil && *schedule.Spec.SkipImmediately {
 		*schedule.Spec.SkipImmediately = false

@@ -20,9 +20,10 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	clocks "k8s.io/utils/clock"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -90,7 +92,6 @@ func NewPodVolumeRestoreReconciler(
 		preparingTimeout:      preparingTimeout,
 		resourceTimeout:       resourceTimeout,
 		exposer:               exposer.NewPodVolumeExposer(kubeClient, logger),
-		cancelledPVR:          make(map[string]time.Time),
 		dataMovePriorityClass: dataMovePriorityClass,
 		privileged:            privileged,
 		repoConfigMgr:         repoConfigMgr,
@@ -114,7 +115,7 @@ type PodVolumeRestoreReconciler struct {
 	vgdpCounter           *exposer.VgdpCounter
 	preparingTimeout      time.Duration
 	resourceTimeout       time.Duration
-	cancelledPVR          map[string]time.Time
+	cancelledPVR          sync.Map
 	dataMovePriorityClass string
 	privileged            bool
 	repoConfigMgr         repository.ConfigManager
@@ -188,7 +189,7 @@ func (r *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			}
 		}
 	} else {
-		delete(r.cancelledPVR, pvr.Name)
+		r.cancelledPVR.Delete(pvr.Name)
 
 		if controllerutil.ContainsFinalizer(pvr, PodVolumeFinalizer) {
 			if err := UpdatePVRWithRetry(ctx, r.client, req.NamespacedName, log, func(pvr *velerov1api.PodVolumeRestore) bool {
@@ -209,9 +210,9 @@ func (r *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if pvr.Spec.Cancel {
-		if spotted, found := r.cancelledPVR[pvr.Name]; !found {
-			r.cancelledPVR[pvr.Name] = r.clock.Now()
-		} else {
+		v, loaded := r.cancelledPVR.LoadOrStore(pvr.Name, r.clock.Now())
+		if loaded {
+			spotted := v.(time.Time)
 			delay := cancelDelayOthers
 			if pvr.Status.Phase == velerov1api.PodVolumeRestorePhaseInProgress {
 				delay = cancelDelayInProgress
@@ -220,7 +221,7 @@ func (r *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			if time.Since(spotted) > delay {
 				log.Infof("PVR %s is canceled in Phase %s but not handled in rasonable time", pvr.GetName(), pvr.Status.Phase)
 				if r.tryCancelPodVolumeRestore(ctx, pvr, "") {
-					delete(r.cancelledPVR, pvr.Name)
+					r.cancelledPVR.Delete(pvr.Name)
 				}
 
 				return ctrl.Result{}, nil
@@ -236,9 +237,17 @@ func (r *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			return ctrl.Result{}, nil
 		}
 
-		shouldProcess, pod, err := shouldProcess(ctx, r.client, log, pvr)
+		pod, err := getTargetPod(ctx, r.client, log, pvr)
 		if err != nil {
 			return ctrl.Result{}, err
+		}
+		if pod == nil {
+			return ctrl.Result{}, nil
+		}
+
+		shouldProcess, err := shouldProcess(pod, log)
+		if err != nil {
+			return r.errorOut(ctx, pvr, err, "Pod for this PVR is not ready", log)
 		}
 		if !shouldProcess {
 			return ctrl.Result{}, nil
@@ -253,12 +262,6 @@ func (r *PodVolumeRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 		if err := r.acceptPodVolumeRestore(ctx, pvr); err != nil {
 			return ctrl.Result{}, errors.Wrapf(err, "error accepting PVR %s", pvr.Name)
-		}
-
-		initContainerIndex := getInitContainerIndex(pod)
-		if initContainerIndex > 0 {
-			log.Warnf(`Init containers before the %s container may cause issues
-					  if they interfere with volumes being restored: %s index %d`, restorehelper.WaitInitContainer, restorehelper.WaitInitContainer, initContainerIndex)
 		}
 
 		log.Info("Exposing PVR")
@@ -528,7 +531,7 @@ func (r *PodVolumeRestoreReconciler) startCancelableDataPath(asyncBR datapath.As
 
 	if err := asyncBR.StartRestore(pvr.Spec.SnapshotID, datapath.AccessPoint{
 		ByPath: res.ByPod.VolumeName,
-	}, pvr.Spec.UploaderSettings); err != nil {
+	}, pvr.Spec.UploaderSettings, nil); err != nil {
 		return errors.Wrapf(err, "error starting async restore for pod %s, volume %s", res.ByPod.HostingPod.Name, res.ByPod.VolumeName)
 	}
 
@@ -565,30 +568,61 @@ func UpdatePVRStatusToFailed(ctx context.Context, c client.Client, pvr *velerov1
 	return err
 }
 
-func shouldProcess(ctx context.Context, client client.Client, log logrus.FieldLogger, pvr *velerov1api.PodVolumeRestore) (bool, *corev1api.Pod, error) {
-	if !isPVRNew(pvr) {
-		log.Debug("PVR is not new, skip")
-		return false, nil, nil
-	}
-
+func getTargetPod(ctx context.Context, client client.Client, log logrus.FieldLogger, pvr *velerov1api.PodVolumeRestore) (*corev1api.Pod, error) {
 	// we filter the pods during the initialization of cache, if we can get a pod here, the pod must be in the same node with the controller
 	// so we don't need to compare the node anymore
 	pod := &corev1api.Pod{}
 	if err := client.Get(ctx, types.NamespacedName{Namespace: pvr.Spec.Pod.Namespace, Name: pvr.Spec.Pod.Name}, pod); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.WithError(err).Debug("Pod not found on this node, skip")
-			return false, nil, nil
+			return nil, nil
 		}
 		log.WithError(err).Error("Unable to get pod")
-		return false, nil, err
+		return nil, err
 	}
 
-	if !isInitContainerRunning(pod) {
+	return pod, nil
+}
+
+func shouldProcess(targetPod *corev1api.Pod, log logrus.FieldLogger) (bool, error) {
+	if targetPod.Status.Phase == corev1api.PodFailed || targetPod.Status.Phase == corev1api.PodUnknown {
+		return false, errors.Errorf("unexpected state for pod %s/%s", targetPod.Namespace, targetPod.Name)
+	}
+
+	idx := getInitContainerIndex(targetPod)
+	if idx < 0 {
+		return false, errors.Errorf("no restore-wait init container in pod %s/%s", targetPod.Namespace, targetPod.Name)
+	}
+
+	if len(targetPod.Status.InitContainerStatuses) <= idx {
+		log.Debug("Pod init container statuses are not fully populated yet, skip")
+		return false, nil
+	}
+
+	if idx > 0 {
+		log.Warnf(`Init containers before the %s container may cause issues
+					  if they interfere with volumes being restored: %s index %d`, restorehelper.WaitInitContainer, restorehelper.WaitInitContainer, idx)
+	}
+
+	containerStatus := targetPod.Status.InitContainerStatuses[idx]
+
+	if containerStatus.State.Terminated != nil {
+		return false, errors.Errorf("restore-wait init container has already completed in pod %s/%s", targetPod.Namespace, targetPod.Name)
+	}
+
+	if containerStatus.State.Waiting != nil {
+		reason := containerStatus.State.Waiting.Reason
+		if reason == "ImagePullBackOff" || reason == "ErrImageNeverPull" || reason == "CreateContainerConfigError" || reason == "CreateContainerError" || reason == "InvalidImageName" || reason == "ErrImagePull" {
+			return false, errors.Errorf("restore-wait init container in pod %s/%s is in unrecoverable waiting state with reason %s", targetPod.Namespace, targetPod.Name, reason)
+		}
+	}
+
+	if containerStatus.State.Running == nil {
 		log.Debug("Pod is not running restore-wait init container, skip")
-		return false, nil, nil
+		return false, nil
 	}
 
-	return true, pod, nil
+	return true, nil
 }
 
 func (r *PodVolumeRestoreReconciler) closeDataPath(ctx context.Context, pvrName string) {
@@ -770,14 +804,6 @@ func isPVRNew(pvr *velerov1api.PodVolumeRestore) bool {
 	return pvr.Status.Phase == "" || pvr.Status.Phase == velerov1api.PodVolumeRestorePhaseNew
 }
 
-func isInitContainerRunning(pod *corev1api.Pod) bool {
-	// Pod volume wait container can be anywhere in the list of init containers, but must be running.
-	i := getInitContainerIndex(pod)
-	return i >= 0 &&
-		len(pod.Status.InitContainerStatuses)-1 >= i &&
-		pod.Status.InitContainerStatuses[i].State.Running != nil
-}
-
 func getInitContainerIndex(pod *corev1api.Pod) int {
 	// Pod volume wait container can be anywhere in the list of init containers so locate it.
 	for i, initContainer := range pod.Spec.InitContainers {
@@ -812,6 +838,7 @@ func (r *PodVolumeRestoreReconciler) OnDataPathCompleted(ctx context.Context, na
 
 		pvr.Status.Phase = velerov1api.PodVolumeRestorePhaseCompleted
 		pvr.Status.CompletionTimestamp = &metav1.Time{Time: r.clock.Now()}
+		pvr.Status.IncrementalBytes = ptr.To(result.Restore.IncrementalBytes)
 
 		delete(pvr.Labels, exposer.ExposeOnGoingLabel)
 
@@ -870,7 +897,7 @@ func (r *PodVolumeRestoreReconciler) OnDataPathCancelled(ctx context.Context, na
 	}); err != nil {
 		log.WithError(err).Error("error updating PVR status on cancel")
 	} else {
-		delete(r.cancelledPVR, pvr.Name)
+		r.cancelledPVR.Delete(pvr.Name)
 	}
 }
 
@@ -1113,7 +1140,7 @@ func (r *PodVolumeRestoreReconciler) resumeCancellableDataPath(ctx context.Conte
 
 	if err := asyncBR.StartRestore(pvr.Spec.SnapshotID, datapath.AccessPoint{
 		ByPath: res.ByPod.VolumeName,
-	}, pvr.Spec.UploaderSettings); err != nil {
+	}, pvr.Spec.UploaderSettings, nil); err != nil {
 		return errors.Wrapf(err, "error to resume asyncBR watcher for PVR %s", pvr.Name)
 	}
 

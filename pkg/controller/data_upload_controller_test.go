@@ -19,12 +19,13 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	snapshotFake "github.com/kubernetes-csi/external-snapshotter/client/v8/clientset/versioned/fake"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -72,11 +73,25 @@ type FakeClient struct {
 	patchError     error
 	updateConflict error
 	listError      error
+	getErrorMap    map[string]error // key: object kind or name
 }
 
 func (c *FakeClient) Get(ctx context.Context, key kbclient.ObjectKey, obj kbclient.Object, opts ...kbclient.GetOption) error {
 	if c.getError != nil {
 		return c.getError
+	}
+
+	// Check if there's a specific error for this object type
+	if c.getErrorMap != nil {
+		objType := fmt.Sprintf("%T", obj)
+		if err, ok := c.getErrorMap[objType]; ok {
+			return err
+		}
+
+		// Check if there's a specific error for this object name
+		if err, ok := c.getErrorMap[key.Name]; ok {
+			return err
+		}
 	}
 
 	return c.Client.Get(ctx, key, obj)
@@ -209,9 +224,13 @@ func initDataUploaderReconcilerWithError(needError ...error) (*DataUploadReconci
 	if err != nil {
 		return nil, err
 	}
+	err = snapshotv1api.AddToScheme(scheme)
+	if err != nil {
+		return nil, err
+	}
 
 	fakeClient := &FakeClient{
-		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(vsObject, node).Build(),
 	}
 
 	for k := range needError {
@@ -251,6 +270,7 @@ func initDataUploaderReconcilerWithError(needError ...error) (*DataUploadReconci
 		"",  // dataMovePriorityClass
 		nil, // podLabels
 		nil, // podAnnotations
+		nil,
 	), nil
 }
 
@@ -329,7 +349,7 @@ func (f *fakeFSBR) StartBackup(source datapath.AccessPoint, uploaderConfigs map[
 	return f.startErr
 }
 
-func (f *fakeFSBR) StartRestore(snapshotID string, target datapath.AccessPoint, uploaderConfigs map[string]string) error {
+func (f *fakeFSBR) StartRestore(snapshotID string, target datapath.AccessPoint, uploaderConfigs map[string]string, param any) error {
 	return nil
 }
 
@@ -504,7 +524,7 @@ func TestReconcile(t *testing.T) {
 		{
 			name:     "du succeeds for accepted",
 			du:       dataUploadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).SnapshotType(fakeSnapshotType).Result(),
-			pvc:      builder.ForPersistentVolumeClaim("fake-ns", "test-pvc").Result(),
+			pvc:      builder.ForPersistentVolumeClaim("fake-ns", "test-pvc").VolumeName("test-pv").Result(),
 			expected: dataUploadBuilder().Finalizers([]string{DataUploadDownloadFinalizer}).Phase(velerov2alpha1api.DataUploadPhaseAccepted).Result(),
 		},
 		{
@@ -635,6 +655,15 @@ func TestReconcile(t *testing.T) {
 			if test.pvc != nil {
 				err = r.client.Create(ctx, test.pvc)
 				require.NoError(t, err)
+
+				// Create the corresponding PV if PVC references one
+				if test.pvc.Spec.VolumeName != "" {
+					pv := builder.ForPersistentVolume(test.pvc.Spec.VolumeName).
+						CSI("csi.driver", "test-volume-id").
+						ClaimRef(test.pvc.Namespace, test.pvc.Name).Result()
+					err = r.client.Create(ctx, pv)
+					require.NoError(t, err)
+				}
 			}
 
 			if test.dataMgr != nil {
@@ -644,7 +673,7 @@ func TestReconcile(t *testing.T) {
 			}
 
 			if test.sportTime != nil {
-				r.cancelledDataUpload[test.du.Name] = test.sportTime.Time
+				r.cancelledDataUpload.Store(test.du.Name, test.sportTime.Time)
 			}
 
 			if test.constrained {
@@ -724,9 +753,15 @@ func TestReconcile(t *testing.T) {
 			}
 
 			if test.expectCancelRecord {
-				assert.Contains(t, r.cancelledDataUpload, test.du.Name)
+				_, ok := r.cancelledDataUpload.Load(test.du.Name)
+				assert.True(t, ok)
 			} else {
-				assert.Empty(t, r.cancelledDataUpload)
+				empty := true
+				r.cancelledDataUpload.Range(func(key, value any) bool {
+					empty = false
+					return false
+				})
+				assert.True(t, empty)
 			}
 
 			if isDataUploadInFinalState(&du) || du.Status.Phase == velerov2alpha1api.DataUploadPhaseInProgress {
@@ -1513,6 +1548,7 @@ func TestDataUploadSetupExposeParam(t *testing.T) {
 				"upload-priority",
 				tt.args.customLabels,
 				tt.args.customAnnotations,
+				nil,
 			)
 
 			// Act
@@ -1531,4 +1567,51 @@ func TestDataUploadSetupExposeParam(t *testing.T) {
 			assert.Equal(t, tt.want.annotations, csiParam.HostingPodAnnotations)
 		})
 	}
+}
+
+type dataUploadSequenceClock struct {
+	*testclocks.FakeClock
+	mu sync.Mutex
+}
+
+func (c *dataUploadSequenceClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.FakeClock.Step(time.Second)
+	return c.FakeClock.Now()
+}
+
+func TestDataUploadCancelConcurrency(t *testing.T) {
+	ctx := t.Context()
+	du := dataUploadBuilder().Cancel(true).Phase(velerov2alpha1api.DataUploadPhaseInProgress).Result()
+
+	r, err := initDataUploaderReconciler()
+	require.NoError(t, err)
+
+	err = r.client.Create(ctx, du)
+	require.NoError(t, err)
+
+	firstTime := time.Now()
+	// manually store the initial time
+	r.cancelledDataUpload.Store(du.Name, firstTime)
+
+	// Custom clock that returns a different time each call
+	r.Clock = &dataUploadSequenceClock{FakeClock: testclocks.NewFakeClock(firstTime)}
+
+	var wg sync.WaitGroup
+	routines := 50
+	wg.Add(routines)
+
+	for i := 0; i < routines; i++ {
+		go func() {
+			defer wg.Done()
+			_, _ = r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: du.Name, Namespace: du.Namespace}})
+		}()
+	}
+
+	wg.Wait()
+
+	v, ok := r.cancelledDataUpload.Load(du.Name)
+	assert.True(t, ok)
+	assert.Equal(t, firstTime, v.(time.Time), "The initially recorded timestamp should be preserved")
 }

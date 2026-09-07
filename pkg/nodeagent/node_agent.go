@@ -21,7 +21,8 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
+	appsv1api "k8s.io/api/apps/v1"
 	corev1api "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -78,6 +79,44 @@ func isRunning(ctx context.Context, kubeClient kubernetes.Interface, namespace s
 // KbClientIsRunningInNode checks if the node agent pod is running properly in a specified node through kube client. If not, return the error found
 func KbClientIsRunningInNode(ctx context.Context, namespace string, nodeName string, kubeClient kubernetes.Interface) error {
 	return isRunningInNode(ctx, namespace, nodeName, nil, kubeClient)
+}
+
+// IsReady checks whether the node-agent daemonset has at least one ready pod
+// by inspecting the DaemonSet status. Both the linux and windows daemonsets
+// are checked before returning any non-NotFound lookup error, so that a
+// transient error fetching one daemonset does not mask the other daemonset
+// being ready.
+func IsReady(ctx context.Context, namespace string, crClient ctrlclient.Client) error {
+	dsLinux := new(appsv1api.DaemonSet)
+	var lookupErr error
+	if err := crClient.Get(ctx, ctrlclient.ObjectKey{Namespace: namespace, Name: daemonSet}, dsLinux); err != nil {
+		dsLinux = nil
+		if !apierrors.IsNotFound(err) {
+			lookupErr = errors.Wrap(err, "failed to get linux node-agent daemonset")
+		}
+	}
+
+	dsWindows := new(appsv1api.DaemonSet)
+	if err := crClient.Get(ctx, ctrlclient.ObjectKey{Namespace: namespace, Name: daemonsetWindows}, dsWindows); err != nil {
+		dsWindows = nil
+		if !apierrors.IsNotFound(err) {
+			lookupErr = errors.CombineErrors(lookupErr, errors.Wrap(err, "failed to get windows node-agent daemonset"))
+		}
+	}
+
+	if dsLinux != nil && dsLinux.Status.NumberReady > 0 {
+		return nil
+	}
+
+	if dsWindows != nil && dsWindows.Status.NumberReady > 0 {
+		return nil
+	}
+
+	if lookupErr != nil {
+		return lookupErr
+	}
+
+	return errors.New("node-agent is not ready: no ready pods found")
 }
 
 // IsRunningInNode checks if the node agent pod is running properly in a specified node through controller client. If not, return the error found

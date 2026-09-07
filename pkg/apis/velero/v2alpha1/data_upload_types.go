@@ -36,7 +36,7 @@ type DataUploadSpec struct {
 	SourcePVC string `json:"sourcePVC"`
 
 	// DataMover specifies the data mover to be used by the backup.
-	// If DataMover is "" or "velero", the built-in data mover will be used.
+	// If DataMover is "" or "velero", the built-in fs data mover will be used.
 	// +optional
 	DataMover string `json:"datamover,omitempty"`
 
@@ -60,6 +60,16 @@ type DataUploadSpec struct {
 	// OperationTimeout specifies the time used to wait internal operations,
 	// before returning error as timeout.
 	OperationTimeout metav1.Duration `json:"operationTimeout"`
+
+	// SourceFSType is the file system type of the source volume.
+	// +optional
+	SourceFSType string `json:"sourceFSType,omitempty"`
+
+	// ParentSnapshot specifies the parent snapshot that current backup is based on.
+	// If its value is "" or "auto", the data mover finds the recent backup of the same volume as parent.
+	// If its value is "none", the data mover will do a full backup
+	// If its value is a specific snapshotID, the data mover finds the specific snapshot as parent.
+	ParentSnapshot string `json:"parentSnapshot,omitempty"`
 }
 
 type SnapshotType string
@@ -70,6 +80,10 @@ const (
 
 // CSISnapshotSpec is the specification for a CSI snapshot.
 type CSISnapshotSpec struct {
+	// VolumeSnapshotNamespace is the namespece of the volume snapshot to be backed up
+	// +optional
+	VolumeSnapshotNamespace string `json:"volumeSnapshotNamespace"`
+
 	// VolumeSnapshot is the name of the volume snapshot to be backed up
 	VolumeSnapshot string `json:"volumeSnapshot"`
 
@@ -155,9 +169,13 @@ type DataUploadStatus struct {
 	// +optional
 	Progress shared.DataMoveOperationProgress `json:"progress,omitempty"`
 
-	// IncrementalBytes holds the number of bytes new or changed since the last backup
+	// IncrementalBytes holds the number of bytes new or changed since the last backup.
+	// A nil value means the uploader did not report a figure; a pointer to 0 means it
+	// reported zero, i.e. nothing changed and nothing was transferred. The two are
+	// distinct: erasing a measured zero makes a perfect incremental indistinguishable
+	// from a full transfer in every downstream report.
 	// +optional
-	IncrementalBytes int64 `json:"incrementalBytes,omitempty"`
+	IncrementalBytes *int64 `json:"incrementalBytes,omitempty"`
 
 	// Node is name of the node where the DataUpload is processed.
 	// +optional
@@ -193,6 +211,7 @@ type DataUploadStatus struct {
 // +kubebuilder:printcolumn:name="Storage Location",type="string",JSONPath=".spec.backupStorageLocation",description="Name of the Backup Storage Location where this backup should be stored"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp",description="Time duration since this DataUpload was created"
 // +kubebuilder:printcolumn:name="Node",type="string",JSONPath=".status.node",description="Name of the node where the DataUpload is processed"
+// +kubebuilder:resource:shortName=du
 
 // DataUpload acts as the protocol between data mover plugins and data mover controller for the datamover backup operation
 type DataUpload struct {
@@ -253,4 +272,12 @@ type DataUploadResult struct {
 	// SnapshotSize is the logical size in Bytes of the snapshot.
 	// +optional
 	SnapshotSize int64 `json:"snapshotSize,omitempty"`
+
+	// FSType is the file system type of the volume.
+	// +optional
+	FSType string `json:"fsType,omitempty"`
+
+	// SnapshotClass is the name of the snapshot class that the volume snapshot is created with
+	// +optional
+	SnapshotClass string `json:"snapshotClass,omitempty"`
 }

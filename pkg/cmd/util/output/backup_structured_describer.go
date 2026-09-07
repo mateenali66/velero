@@ -28,6 +28,7 @@ import (
 
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/cacert"
@@ -55,6 +56,8 @@ func DescribeBackupInSF(
 		if backup.Spec.ResourcePolicy != nil {
 			DescribeResourcePoliciesInSF(d, backup.Spec.ResourcePolicy)
 		}
+
+		DescribeGlobalVolumePolicyInSF(d, backup)
 
 		status := backup.Status
 		if len(status.ValidationErrors) > 0 {
@@ -133,6 +136,9 @@ func DescribeBackupSpecInSF(d *StructuredDescriber, spec velerov1api.BackupSpec)
 		s = spec.DataMover
 	}
 	backupSpecInfo["dataMover"] = s
+	if string(spec.BackupType) != "" {
+		backupSpecInfo["backupType"] = spec.BackupType
+	}
 
 	// describe TTL
 	backupSpecInfo["TTL"] = spec.TTL.Duration.String()
@@ -464,9 +470,16 @@ func describeDataMovementInSF(details bool, info *volume.BackupVolumeInfo, snaps
 
 		dataMovement["uploaderType"] = info.SnapshotDataMovementInfo.UploaderType
 		dataMovement["result"] = string(info.Result)
-		if info.SnapshotDataMovementInfo.Size > 0 || info.SnapshotDataMovementInfo.IncrementalSize > 0 {
+		if info.SnapshotDataMovementInfo.Size > 0 {
 			dataMovement["size"] = info.SnapshotDataMovementInfo.Size
-			dataMovement["incrementalSize"] = info.SnapshotDataMovementInfo.IncrementalSize
+		}
+		// Emit whenever measured, including zero - a zero-delta incremental transferred
+		// nothing, and that has to be reportable rather than absent.
+		if info.SnapshotDataMovementInfo.IncrementalSize != nil {
+			dataMovement["incrementalSize"] = *info.SnapshotDataMovementInfo.IncrementalSize
+		}
+		if info.SnapshotDataMovementInfo.ParentSnapshot != "" {
+			dataMovement["parentSnapshot"] = info.SnapshotDataMovementInfo.ParentSnapshot
 		}
 
 		snapshotDetail["dataMovement"] = dataMovement
@@ -611,6 +624,19 @@ func DescribeResourcePoliciesInSF(d *StructuredDescriber, resPolicies *corev1api
 	policiesInfo["type"] = resPolicies.Kind
 	policiesInfo["name"] = resPolicies.Name
 	d.Describe("resourcePolicies", policiesInfo)
+}
+
+// DescribeGlobalVolumePolicyInSF describes the global backup volume policies ConfigMap that
+// contributed to the backup, if any, in structured format.
+func DescribeGlobalVolumePolicyInSF(d *StructuredDescriber, backup *velerov1api.Backup) {
+	name := backup.Annotations[velerov1api.GlobalBackupVolumePolicyConfigMapAnnotation]
+	if name == "" {
+		return
+	}
+	d.Describe("globalVolumePolicies", map[string]any{
+		"type": resourcepolicies.ConfigmapRefType,
+		"name": name,
+	})
 }
 
 func describeResultInSF(m map[string]any, result results.Result) {

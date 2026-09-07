@@ -21,18 +21,22 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
-	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -43,6 +47,7 @@ import (
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
 	fakeClient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	velerov1api "github.com/vmware-tanzu/velero/pkg/apis/velero/v1"
 	pkgbackup "github.com/vmware-tanzu/velero/pkg/backup"
 	"github.com/vmware-tanzu/velero/pkg/builder"
@@ -59,6 +64,7 @@ import (
 	ibav1 "github.com/vmware-tanzu/velero/pkg/plugin/velero/itemblockaction/v1"
 	velerotest "github.com/vmware-tanzu/velero/pkg/test"
 	"github.com/vmware-tanzu/velero/pkg/util/boolptr"
+	"github.com/vmware-tanzu/velero/pkg/util/datamover"
 	kubeutil "github.com/vmware-tanzu/velero/pkg/util/kube"
 	"github.com/vmware-tanzu/velero/pkg/util/logging"
 )
@@ -520,6 +526,63 @@ func TestDefaultBackupTTL(t *testing.T) {
 	}
 }
 
+func TestPrepareBackupRequest_SetBackupType(t *testing.T) {
+	now, err := time.Parse(time.RFC1123Z, time.RFC1123Z)
+	require.NoError(t, err)
+	now = now.Local()
+
+	tests := []struct {
+		name               string
+		backup             *velerov1api.Backup
+		expectedBackupType velerov1api.BackupType
+	}{
+		{
+			name:               "default backup type is Incremental",
+			backup:             defaultBackup().Result(),
+			expectedBackupType: velerov1api.BackupTypeIncremental,
+		},
+		{
+			name:               "backup type is set to Full",
+			backup:             defaultBackup().BackupType(velerov1api.BackupTypeFull).Result(),
+			expectedBackupType: velerov1api.BackupTypeFull,
+		},
+		{
+			name:               "backup type is set to Incremental",
+			backup:             defaultBackup().BackupType(velerov1api.BackupTypeIncremental).Result(),
+			expectedBackupType: velerov1api.BackupTypeIncremental,
+		},
+	}
+
+	for _, test := range tests {
+		formatFlag := logging.FormatText
+		var (
+			fakeClient kbclient.Client
+			logger     = logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+		)
+
+		t.Run(test.name, func(t *testing.T) {
+			apiServer := velerotest.NewAPIServer(t)
+			discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+			require.NoError(t, err)
+			// add the test's backup storage location if it's different than the default
+			fakeClient = velerotest.NewFakeControllerRuntimeClient(t)
+			c := &backupReconciler{
+				logger:          logger,
+				discoveryHelper: discoveryHelper,
+				kbClient:        fakeClient,
+				formatFlag:      formatFlag,
+				clock:           testclocks.NewFakeClock(now),
+			}
+
+			res := c.prepareBackupRequest(ctx, test.backup, logger)
+			defer res.WorkerPool.Stop()
+			assert.NotNil(t, res)
+
+			assert.Equal(t, test.expectedBackupType, res.Spec.BackupType)
+		})
+	}
+}
+
 func TestPrepareBackupRequest_SetsVGSLabelKey(t *testing.T) {
 	now, err := time.Parse(time.RFC1123Z, time.RFC1123Z)
 	require.NoError(t, err)
@@ -742,6 +805,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -782,6 +847,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -826,6 +893,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -867,6 +936,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -908,6 +979,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -950,6 +1023,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -992,6 +1067,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -1034,6 +1111,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -1076,6 +1155,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:          velerov1api.BackupPhaseFinalizing,
@@ -1119,10 +1200,12 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:               velerov1api.BackupPhaseFailed,
-					FailureReason:       "backup already exists in object storage",
+					FailureReason:       "backup execution failed: backup already exists in object storage",
 					Version:             1,
 					FormatVersion:       "1.1.0",
 					StartTimestamp:      &timestamp,
@@ -1162,10 +1245,12 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:               velerov1api.BackupPhaseFailed,
-					FailureReason:       "error checking if backup already exists in object storage: Backup already exists in object storage",
+					FailureReason:       "backup execution failed: error checking if backup already exists in object storage: Backup already exists in object storage",
 					Version:             1,
 					FormatVersion:       "1.1.0",
 					StartTimestamp:      &timestamp,
@@ -1205,6 +1290,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.True(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1249,6 +1336,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1293,6 +1382,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1337,6 +1428,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.True(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1382,6 +1475,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.False(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1426,6 +1521,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					SnapshotMoveData:                 boolptr.True(),
 					ExcludedClusterScopedResources:   autoExcludeClusterScopedResources,
 					ExcludedNamespaceScopedResources: autoExcludeNamespaceScopedResources,
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1476,6 +1573,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					ExcludedClusterScopedResources:   append([]string{"clusterroles"}, autoExcludeClusterScopedResources...),
 					IncludedNamespaceScopedResources: []string{"pods"},
 					ExcludedNamespaceScopedResources: append([]string{"secrets"}, autoExcludeNamespaceScopedResources...),
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1526,6 +1625,8 @@ func TestProcessBackupCompletions(t *testing.T) {
 					ExcludedClusterScopedResources:   append([]string{"clusterroles"}, autoExcludeClusterScopedResources...),
 					IncludedNamespaceScopedResources: []string{"pods"},
 					ExcludedNamespaceScopedResources: append([]string{"secrets"}, autoExcludeNamespaceScopedResources...),
+					BackupType:                       velerov1api.BackupTypeIncremental,
+					DataMover:                        datamover.GetDefaultBuiltInDataMover(),
 				},
 				Status: velerov1api.BackupStatus{
 					Phase:                       velerov1api.BackupPhaseFinalizing,
@@ -1656,7 +1757,7 @@ func TestProcessBackupCompletions(t *testing.T) {
 			err = c.kbClient.Get(t.Context(), kbclient.ObjectKey{Namespace: test.backup.Namespace, Name: test.backup.Name}, res)
 			require.NoError(t, err)
 			res.ResourceVersion = ""
-			assert.Equal(t, test.expectedResult, res)
+			assert.Empty(t, cmp.Diff(test.expectedResult, res, cmpopts.IgnoreFields(velerov1api.Backup{}, "TypeMeta")))
 			// reset defaultBackupLocation resourceVersion
 			defaultBackupLocation.ObjectMeta.ResourceVersion = ""
 		})
@@ -1961,6 +2062,48 @@ func Test_getLastSuccessBySchedule(t *testing.T) {
 	}
 }
 
+// Test_resyncBackupMetrics_prunesStaleTimestamps verifies that resyncBackupMetrics
+// removes backupLastSuccessfulTimestamp entries for schedules that no longer have
+// any completed backups (e.g. after the schedule and its backups are deleted).
+func Test_resyncBackupMetrics_prunesStaleTimestamps(t *testing.T) {
+	baseTime, err := time.Parse(time.RFC1123, time.RFC1123)
+	require.NoError(t, err)
+
+	m := metrics.NewServerMetrics()
+	gauge := m.Metrics()["backup_last_successful_timestamp"]
+
+	activeBackup := builder.ForBackup("velero", "b1").
+		ObjectMeta(builder.WithLabels(velerov1api.ScheduleNameLabel, "active-schedule")).
+		Phase(velerov1api.BackupPhaseCompleted).
+		CompletionTimestamp(baseTime).
+		Result()
+
+	deletedBackup := builder.ForBackup("velero", "b2").
+		ObjectMeta(builder.WithLabels(velerov1api.ScheduleNameLabel, "deleted-schedule")).
+		Phase(velerov1api.BackupPhaseCompleted).
+		CompletionTimestamp(baseTime).
+		Result()
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, activeBackup, deletedBackup)
+
+	c := &backupReconciler{
+		kbClient: fakeClient,
+		logger:   logrus.StandardLogger(),
+		metrics:  m,
+	}
+
+	// First resync: sets metrics for both schedules
+	c.resyncBackupMetrics()
+	assert.Equal(t, 2, testutil.CollectAndCount(gauge))
+
+	// Simulate schedule deletion: remove the backup for "deleted-schedule"
+	require.NoError(t, fakeClient.Delete(t.Context(), deletedBackup))
+
+	// Second resync: prunes "deleted-schedule" metric, keeps "active-schedule"
+	c.resyncBackupMetrics()
+	assert.Equal(t, 1, testutil.CollectAndCount(gauge))
+}
+
 // Unit tests to make sure that the backup's status is updated correctly during reconcile.
 // To clear up confusion whether status can be updated with Patch alone without status writer and not kbClient.Status().Patch()
 func TestPatchResourceWorksWithStatus(t *testing.T) {
@@ -2015,6 +2158,334 @@ func TestPatchResourceWorksWithStatus(t *testing.T) {
 			// check fromCluster is equal to updated
 			if !reflect.DeepEqual(fromCluster, tt.args.updated) {
 				t.Error(cmp.Diff(fromCluster, tt.args.updated))
+			}
+		})
+	}
+}
+
+// TestPrepareBackupRequest_NamespacedFilterPoliciesIncompatibleWithOldFilters verifies
+// that a backup referencing a ResourcePolicy ConfigMap with namespacedFilterPolicies
+// produces a validation error when old-style resource filters are also set on the spec.
+func TestPrepareBackupRequest_NamespacedFilterPoliciesIncompatibleWithOldFilters(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+namespacedFilterPolicies:
+- namespaces: ["production"]
+  resourceFilters:
+  - kinds: ["Deployment"]
+    names: ["api-server"]
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-filter-policy",
+			Namespace: velerov1api.DefaultNamespace,
+		},
+		Data: map[string]string{"policy": policyYAML},
+	}
+
+	backup := defaultBackup().IncludedResources("deployments").Result()
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{
+		Kind: "configmap",
+		Name: "my-filter-policy",
+	}
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		logger:          logger,
+		discoveryHelper: discoveryHelper,
+		kbClient:        fakeClient,
+		clock:           &clock.RealClock{},
+		formatFlag:      formatFlag,
+	}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+
+	require.NotEmpty(t, res.Status.ValidationErrors)
+
+	hasTargetError := slices.ContainsFunc(res.Status.ValidationErrors, func(e string) bool {
+		return strings.Contains(e, "namespace-scoped or fine-grained global filter policies")
+	})
+
+	assert.True(t, hasTargetError, "expected validation error about namespacedFilterPolicies incompatibility with old-style filters, got: %v", res.Status.ValidationErrors)
+}
+
+// TestPrepareBackupRequest_GlobalVolumePolicies verifies that the cluster-wide global backup
+// volume policies are merged into the request and that the contributing ConfigMap is recorded
+// on the backup so `velero backup describe` can surface it.
+func TestPrepareBackupRequest_GlobalVolumePolicies(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	globalCM := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "global-volume-policy", Namespace: velerov1api.DefaultNamespace},
+		Data: map[string]string{"policies.yaml": `version: v1
+volumePolicies:
+  - conditions:
+      storageClass:
+        - gp2
+    action:
+      type: skip
+`},
+	}
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, globalCM,
+		builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "loc-1").Result())
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		logger:                        logger,
+		discoveryHelper:               discoveryHelper,
+		kbClient:                      fakeClient,
+		clock:                         &clock.RealClock{},
+		formatFlag:                    formatFlag,
+		defaultBackupLocation:         "loc-1",
+		globalVolumePoliciesConfigMap: "global-volume-policy",
+	}
+
+	backup := defaultBackup().StorageLocation("loc-1").Result()
+	res := c.prepareBackupRequest(ctx, backup, logger)
+	defer res.WorkerPool.Stop()
+
+	// The global volume policies must load cleanly (no policy-related validation error).
+	for _, e := range res.Status.ValidationErrors {
+		assert.NotContains(t, e, "global backup volume policies")
+	}
+	require.NotNil(t, res.ResPolicies)
+	assert.Equal(t, "global-volume-policy", res.Annotations[velerov1api.GlobalBackupVolumePolicyConfigMapAnnotation])
+
+	action, err := res.ResPolicies.GetMatchAction(resourcepolicies.VolumeFilterData{
+		PersistentVolume: &corev1api.PersistentVolume{Spec: corev1api.PersistentVolumeSpec{StorageClassName: "gp2"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, action)
+	assert.Equal(t, resourcepolicies.Skip, action.Type)
+}
+
+// TestPrepareBackupRequest_GlobalVolumePolicies_LoadError verifies that when the configured
+// global backup volume policies ConfigMap cannot be loaded, a validation error is recorded and
+// the contributing-ConfigMap annotation is not set on the backup.
+func TestPrepareBackupRequest_GlobalVolumePolicies_LoadError(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	// No ConfigMap with this name exists, so loading the global policies fails.
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t,
+		builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "loc-1").Result())
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		logger:                        logger,
+		discoveryHelper:               discoveryHelper,
+		kbClient:                      fakeClient,
+		clock:                         &clock.RealClock{},
+		formatFlag:                    formatFlag,
+		defaultBackupLocation:         "loc-1",
+		globalVolumePoliciesConfigMap: "missing-global-volume-policy",
+	}
+
+	backup := defaultBackup().StorageLocation("loc-1").Result()
+	res := c.prepareBackupRequest(ctx, backup, logger)
+	defer res.WorkerPool.Stop()
+
+	// The failure to load the global policies must surface as a validation error.
+	var hasGlobalPolicyError bool
+	for _, e := range res.Status.ValidationErrors {
+		if strings.Contains(e, "global backup volume policies") {
+			hasGlobalPolicyError = true
+		}
+	}
+	assert.True(t, hasGlobalPolicyError, "expected a validation error about global backup volume policies, got: %v", res.Status.ValidationErrors)
+	// The annotation is only set when the policies load successfully.
+	assert.Empty(t, res.Annotations[velerov1api.GlobalBackupVolumePolicyConfigMapAnnotation])
+}
+
+// TestPrepareBackupRequest_ClusterScopedFilterPolicyIncompatibleWithOldFilters verifies
+// that a backup referencing a ResourcePolicy ConfigMap with clusterScopedFilterPolicy
+// produces a validation error when old-style resource filters are also set on the spec.
+func TestPrepareBackupRequest_ClusterScopedFilterPolicyIncompatibleWithOldFilters(t *testing.T) {
+	formatFlag := logging.FormatText
+	logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+	policyYAML := `version: v1
+clusterScopedFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    names: ["my-app-*"]
+`
+	policyConfigMap := &corev1api.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-cluster-filter-policy",
+			Namespace: velerov1api.DefaultNamespace,
+		},
+		Data: map[string]string{"policy": policyYAML},
+	}
+
+	backup := defaultBackup().IncludedResources("clusterroles").Result()
+	backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{
+		Kind: "configmap",
+		Name: "my-cluster-filter-policy",
+	}
+
+	fakeClient := velerotest.NewFakeControllerRuntimeClient(t, policyConfigMap)
+
+	apiServer := velerotest.NewAPIServer(t)
+	discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+	require.NoError(t, err)
+
+	c := &backupReconciler{
+		logger:          logger,
+		discoveryHelper: discoveryHelper,
+		kbClient:        fakeClient,
+		clock:           &clock.RealClock{},
+		formatFlag:      formatFlag,
+	}
+
+	res := c.prepareBackupRequest(ctx, backup, logger)
+
+	require.NotEmpty(t, res.Status.ValidationErrors)
+
+	hasClusterError := slices.ContainsFunc(res.Status.ValidationErrors, func(e string) bool {
+		return strings.Contains(e, "namespace-scoped or fine-grained global filter policies")
+	})
+
+	assert.True(t, hasClusterError, "expected validation error about clusterScopedFilterPolicy incompatibility with old-style filters, got: %v", res.Status.ValidationErrors)
+}
+
+const (
+	namespacedFilterPolicyYAML = `version: v1
+namespacedFilterPolicies:
+- namespaces: ["production"]
+  resourceFilters:
+  - kinds: ["Deployment"]
+    names: ["api-server"]
+`
+	clusterScopedFilterPolicyYAML = `version: v1
+clusterScopedFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    names: ["my-app-*"]
+`
+	bothFilterPoliciesYAML = `version: v1
+namespacedFilterPolicies:
+- namespaces: ["production"]
+  resourceFilters:
+  - kinds: ["Deployment"]
+    names: ["api-server"]
+clusterScopedFilterPolicy:
+  resourceFilters:
+  - kinds: ["ClusterRole"]
+    names: ["my-app-*"]
+`
+)
+
+// TestPrepareBackupRequest_FilterPoliciesWithNewFilters verifies that backups referencing
+// a ResourcePolicy ConfigMap with namespacedFilterPolicies and/or clusterScopedFilterPolicy
+// succeed when old-style resource filters are not set on the spec.
+func TestPrepareBackupRequest_FilterPoliciesWithNewFilters(t *testing.T) {
+	tests := []struct {
+		name                      string
+		policyYAML                string
+		policyConfigMapName       string
+		backup                    *velerov1api.Backup
+		expectNamespacedPolicies  int
+		expectClusterScopedPolicy bool
+	}{
+		{
+			name:                     "namespacedFilterPolicies only",
+			policyYAML:               namespacedFilterPolicyYAML,
+			policyConfigMapName:      "my-filter-policy",
+			backup:                   defaultBackup().StorageLocation("loc-1").Result(),
+			expectNamespacedPolicies: 1,
+		},
+		{
+			name:                      "clusterScopedFilterPolicy only",
+			policyYAML:                clusterScopedFilterPolicyYAML,
+			policyConfigMapName:       "my-cluster-filter-policy",
+			backup:                    defaultBackup().StorageLocation("loc-1").Result(),
+			expectClusterScopedPolicy: true,
+		},
+		{
+			name:                      "both filter policies",
+			policyYAML:                bothFilterPoliciesYAML,
+			policyConfigMapName:       "my-combined-filter-policy",
+			backup:                    defaultBackup().StorageLocation("loc-1").Result(),
+			expectNamespacedPolicies:  1,
+			expectClusterScopedPolicy: true,
+		},
+		{
+			name:                "with new-style spec filters",
+			policyYAML:          bothFilterPoliciesYAML,
+			policyConfigMapName: "my-combined-filter-policy",
+			backup: defaultBackup().
+				StorageLocation("loc-1").
+				IncludedNamespaceScopedResources("deployments").
+				IncludedClusterScopedResources("clusterroles").
+				Result(),
+			expectNamespacedPolicies:  1,
+			expectClusterScopedPolicy: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			formatFlag := logging.FormatText
+			logger := logging.DefaultLogger(logrus.DebugLevel, formatFlag)
+
+			policyConfigMap := &corev1api.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      test.policyConfigMapName,
+					Namespace: velerov1api.DefaultNamespace,
+				},
+				Data: map[string]string{"policy": test.policyYAML},
+			}
+
+			test.backup.Spec.ResourcePolicy = &corev1api.TypedLocalObjectReference{
+				Kind: "configmap",
+				Name: test.policyConfigMapName,
+			}
+
+			backupLocation := builder.ForBackupStorageLocation(velerov1api.DefaultNamespace, "loc-1").
+				Phase(velerov1api.BackupStorageLocationPhaseAvailable).Result()
+			fakeClient := velerotest.NewFakeControllerRuntimeClient(t, backupLocation, policyConfigMap)
+
+			apiServer := velerotest.NewAPIServer(t)
+			discoveryHelper, err := discovery.NewHelper(apiServer.DiscoveryClient, logger)
+			require.NoError(t, err)
+
+			c := &backupReconciler{
+				logger:          logger,
+				discoveryHelper: discoveryHelper,
+				kbClient:        fakeClient,
+				clock:           &clock.RealClock{},
+				formatFlag:      formatFlag,
+			}
+
+			res := c.prepareBackupRequest(ctx, test.backup, logger)
+			defer res.WorkerPool.Stop()
+
+			assert.Empty(t, res.Status.ValidationErrors)
+			hasIncompatibilityError := slices.ContainsFunc(res.Status.ValidationErrors, func(e string) bool {
+				return strings.Contains(e, "namespace-scoped or fine-grained global filter policies")
+			})
+			assert.False(t, hasIncompatibilityError)
+
+			require.NotNil(t, res.ResPolicies)
+			assert.Len(t, res.ResPolicies.GetNamespacedFilterPolicies(), test.expectNamespacedPolicies)
+			if test.expectClusterScopedPolicy {
+				assert.NotNil(t, res.ResPolicies.GetClusterScopedFilterPolicy())
+			} else {
+				assert.Nil(t, res.ResPolicies.GetClusterScopedFilterPolicy())
 			}
 		})
 	}

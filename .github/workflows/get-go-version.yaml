@@ -10,6 +10,9 @@ on:
         description: "The expected Go version"
         value: ${{ jobs.extract.outputs.version }}
 
+permissions:
+  contents: read
+
 jobs:
   extract:
       runs-on: ubuntu-latest
@@ -17,7 +20,7 @@ jobs:
         version: ${{ steps.pick-version.outputs.version }}
       steps:
         - name: Check out the code
-          uses: actions/checkout@v6
+          uses: actions/checkout@v7
 
         - id: pick-version
           run: |
@@ -25,7 +28,7 @@ jobs:
               version=$(grep '^go ' go.mod | awk '{print $2}' | cut -d. -f1-2)
             else
               goDirectiveVersion=$(grep '^go ' go.mod | awk '{print $2}')
-              toolChainVersion=$(grep '^toolchain ' go.mod | awk '{print $2}')
+              toolChainVersion=$(grep '^toolchain ' go.mod | awk '{print $2}' | sed 's/^go//')
               version=$(printf "%s\n%s\n" "$goDirectiveVersion" "$toolChainVersion" | sort -V | tail -n1)
             fi
 

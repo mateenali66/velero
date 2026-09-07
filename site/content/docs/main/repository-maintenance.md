@@ -23,7 +23,7 @@ If there is a key value as `global` in the map, the key's value is applied to al
 The other keys in the map is the combination of three elements of a BackupRepository, because those three keys can identify a unique BackupRepository:
 * The namespace in which BackupRepository backs up volume data.
 * The BackupRepository referenced BackupStorageLocation's name.
-* The BackupRepository's type. Possible values are `kopia` and `restic`.
+* The BackupRepository's type. Possible value is `kopia`.
 
 If there is a key match with BackupRepository, the key's value is applied to the BackupRepository's maintenance jobs.
 By this way, it's possible to let user configure before the BackupRepository is created.
@@ -45,7 +45,6 @@ For example, the following BackupRepository's key should be `test-default-kopia`
     backupStorageLocation: default
     maintenanceFrequency: 1h0m0s
     repositoryType: kopia
-    resticIdentifier: gs:jxun:/restic/test
     volumeNamespace: test
 ```
 
@@ -135,7 +134,7 @@ The frequency of running maintenance jobs could be set by the below command when
 ```bash
 velero install --default-repo-maintain-frequency <DURATION>
 ```
-For Kopia the default maintenance frequency is 1 hour, and Restic is 7 * 24 hours.
+For Kopia the default maintenance frequency is 1 hour.
 
 ### Full Maintenance Interval customization
 See [backup repository configuration][3]  
@@ -200,5 +199,5 @@ Note that priority class configuration is only read from the global configuratio
 [1]: velero-install.md#usage
 [2]: node-agent-concurrency.md
 [3]: backup-repository-configuration.md#full-maintenance-interval-customization
-[4]: https://github.com/vmware-tanzu/velero/blob/d5a2e7e6b9512e8ba52ec269ed5ce9a0fa23548c/pkg/util/third_party.go#L19-L21
-[5]: https://github.com/vmware-tanzu/velero/blob/d5a2e7e6b9512e8ba52ec269ed5ce9a0fa23548c/pkg/util/third_party.go#L23-L25
+[4]: https://github.com/velero-io/velero/blob/d5a2e7e6b9512e8ba52ec269ed5ce9a0fa23548c/pkg/util/third_party.go#L19-L21
+[5]: https://github.com/velero-io/velero/blob/d5a2e7e6b9512e8ba52ec269ed5ce9a0fa23548c/pkg/util/third_party.go#L23-L25

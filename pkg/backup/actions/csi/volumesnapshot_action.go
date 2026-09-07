@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/errors"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -78,6 +78,8 @@ func (p *volumeSnapshotBackupItemAction) Execute(
 ) {
 	p.log.Infof("Executing VolumeSnapshotBackupItemAction")
 
+	ctx := context.Background()
+
 	vs := new(snapshotv1api.VolumeSnapshot)
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(
 		item.UnstructuredContent(), vs); err != nil {
@@ -90,7 +92,7 @@ func (p *volumeSnapshotBackupItemAction) Execute(
 			WithField("Backup", fmt.Sprintf("%s/%s", backup.Namespace, backup.Name)).
 			WithField("BackupPhase", backup.Status.Phase).Debugf("Cleaning VolumeSnapshots.")
 
-		csi.DeleteReadyVolumeSnapshot(*vs, p.crClient, p.log)
+		csi.DeleteReadyVolumeSnapshot(ctx, *vs, p.crClient, p.log)
 		return item, nil, "", nil, nil
 	}
 
@@ -115,11 +117,9 @@ func (p *volumeSnapshotBackupItemAction) Execute(
 	p.log.Infof("Getting VolumesnapshotContent for Volumesnapshot %s/%s",
 		vs.Namespace, vs.Name)
 
-	ctx := context.TODO()
-
 	vsc, err := csi.GetVSCForVS(ctx, vs, p.crClient)
 	if err != nil {
-		csi.CleanupVolumeSnapshot(vs, p.crClient, p.log)
+		csi.CleanupVolumeSnapshot(ctx, vs, p.crClient, p.log)
 		return nil, nil, "", nil, errors.WithStack(err)
 	}
 
@@ -187,7 +187,7 @@ func (p *volumeSnapshotBackupItemAction) Execute(
 		)
 
 		if vscPatchError := p.crClient.Patch(
-			context.TODO(),
+			ctx,
 			vsc,
 			crclient.MergeFrom(originVSC),
 		); vscPatchError != nil {
@@ -203,7 +203,7 @@ func (p *volumeSnapshotBackupItemAction) Execute(
 	originVS := vs.DeepCopy()
 	kubeutil.AddAnnotations(&vs.ObjectMeta, annotations)
 	if err := p.crClient.Patch(
-		context.TODO(),
+		ctx,
 		vs,
 		crclient.MergeFrom(originVS),
 	); err != nil {
@@ -269,8 +269,8 @@ func (p *volumeSnapshotBackupItemAction) Progress(
 	}
 	var err error
 	if progress.Started, err = time.Parse(time.RFC3339, operationIDParts[2]); err != nil {
-		p.log.Errorf("error parsing operation ID's StartedTime",
-			"part into time %s: %s", operationID, err.Error())
+		p.log.Errorf("error parsing operation ID's StartedTime part into time %s: %s",
+			operationID, err.Error())
 		return progress, errors.WithStack(err)
 	}
 

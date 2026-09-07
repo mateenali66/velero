@@ -297,6 +297,9 @@ For detailed information, see [BackupPVC Configuration for Data Movement Backup]
 - **`storageClass`**: Alternative storage class for backup PVCs (defaults to source PVC's storage class)
 - **`readOnly`**: This is a boolean value. If set to `true` then `ReadOnlyMany` will be the only value set to the backupPVC's access modes. Otherwise `ReadWriteOnce` value will be used.
 - **`spcNoRelabeling`**: This is a boolean value. If set to true, then `pod.Spec.SecurityContext.SELinuxOptions.Type` will be set to `spc_t`. From the SELinux point of view, this will be considered a `Super Privileged Container` which means that selinux enforcement will be disabled and volume relabeling will not occur. This field is ignored if `readOnly` is `false`.
+- **`secretNames`**: List of secret names to copy from the source PVC's namespace to the Velero namespace before creating the backupPVC (deleted after the DataUpload completes). Needed for CSI drivers that require namespace-scoped secrets to provision the volume, e.g. ODF/ceph-csi encrypted volumes (`ceph-csi-kms-token`).
+- **`configMapNames`**: List of configmap names to copy from the source PVC's namespace to the Velero namespace before creating the backupPVC (deleted after the DataUpload completes). Needed for CSI drivers that require namespace-scoped configmaps to provision the volume, e.g. a tenant ceph-csi KMS config (`ceph-csi-kms-config`).
+- **`readWriteOncePod`**: This is a boolean value. If set to `true`, then `ReadWriteOncePod` will be the only value set to the backupPVC's access modes, so the kubelet labels the volume at mount time instead of relabeling every file. Requires a CSI driver with `seLinuxMount: true` and a storage class that supports `ReadWriteOncePod` PVCs from a snapshot. This field is ignored if `readOnly` is `true`.
 
 **Use Cases:**
 - Use read-only volumes for faster snapshot-to-volume conversion
@@ -307,6 +310,7 @@ For detailed information, see [BackupPVC Configuration for Data Movement Backup]
 **Important Notes:**
 - Ensure specified storage classes exist and support required access modes
 - In SELinux environments, always set `spcNoRelabeling: true` when using `readOnly: true`
+- In SELinux environments where the storage does not support `ReadOnlyMany`, use `readWriteOncePod: true` instead; it is ignored when `readOnly: true` is also set
 - Failures result in DataUpload CR staying in `Accepted` phase until timeout (30m default)
 
 #### Storage Class Mapping
@@ -360,6 +364,8 @@ For detailed information, see [RestorePVC Configuration for Data Movement Restor
 
 #### Configuration Options
 - **`ignoreDelayBinding`**: Ignore `WaitForFirstConsumer` binding mode constraints
+- **`secretNames`**: List of secret names to copy from the target (restore) namespace to the Velero namespace before creating the restorePVC (deleted after the DataDownload completes). Needed for CSI drivers that require namespace-scoped secrets to provision the volume, e.g. ODF/ceph-csi encrypted volumes (`ceph-csi-kms-token`).
+- **`configMapNames`**: List of configmap names to copy from the target (restore) namespace to the Velero namespace before creating the restorePVC (deleted after the DataDownload completes). Needed for CSI drivers that require namespace-scoped configmaps to provision the volume, e.g. a tenant ceph-csi KMS config (`ceph-csi-kms-config`).
 
 **Use Cases:**
 - Improve restore parallelism by not waiting for pod scheduling
@@ -432,7 +438,7 @@ For detailed information, see [Cache PVC Configuration for Data Movement Restore
 
 Add customized labels for data mover pods to support third-party integrations and environment-specific requirements.
 
-If `podLabels` is configured, it supersedes Velero's [in-tree third-party labels](https://github.com/vmware-tanzu/velero/blob/94f64639cee09c5caaa65b65ab5f42175f41c101/pkg/util/third_party.go#L19-L21).
+If `podLabels` is configured, it supersedes Velero's [in-tree third-party labels](https://github.com/velero-io/velero/blob/94f64639cee09c5caaa65b65ab5f42175f41c101/pkg/util/third_party.go#L19-L21).
 If `podLabels` is not configured, Velero uses the in-tree third-party labels for compatibility with common cloud providers and networking solutions.
 
 The configurations work for DataUpload, DataDownload, PodVolumeBackup, and PodVolumeRestore pods.
@@ -465,7 +471,7 @@ The configurations work for DataUpload, DataDownload, PodVolumeBackup, and PodVo
 
 Add customized annotations for data mover pods to support third-party integrations and pod-level configuration.
 
-If `podAnnotations` is configured, it supersedes Velero's [in-tree third-party annotations](https://github.com/vmware-tanzu/velero/blob/94f64639cee09c5caaa65b65ab5f42175f41c101/pkg/util/third_party.go#L23-L25).
+If `podAnnotations` is configured, it supersedes Velero's [in-tree third-party annotations](https://github.com/velero-io/velero/blob/94f64639cee09c5caaa65b65ab5f42175f41c101/pkg/util/third_party.go#L23-L25).
 If `podAnnotations` is not configured, Velero uses the in-tree third-party annotations for compatibility with common cloud providers and networking solutions.
 
 The configurations work for DataUpload, DataDownload, PodVolumeBackup, and PodVolumeRestore pods.

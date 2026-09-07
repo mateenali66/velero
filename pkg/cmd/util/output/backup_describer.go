@@ -28,8 +28,8 @@ import (
 	corev1api "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/cockroachdb/errors"
 	snapshotv1api "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
-	"github.com/pkg/errors"
 
 	"github.com/fatih/color"
 	kbclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +40,7 @@ import (
 	"github.com/vmware-tanzu/velero/pkg/cmd/util/downloadrequest"
 	"github.com/vmware-tanzu/velero/pkg/itemoperation"
 
+	"github.com/vmware-tanzu/velero/internal/resourcepolicies"
 	"github.com/vmware-tanzu/velero/internal/volume"
 	"github.com/vmware-tanzu/velero/pkg/util/collections"
 	"github.com/vmware-tanzu/velero/pkg/util/results"
@@ -93,6 +94,8 @@ func DescribeBackup(
 			DescribeResourcePolicies(d, backup.Spec.ResourcePolicy)
 		}
 
+		DescribeGlobalVolumePolicy(d, backup)
+
 		if backup.Spec.UploaderConfig != nil && backup.Spec.UploaderConfig.ParallelFilesUpload > 0 {
 			d.Println()
 			DescribeUploaderConfigForBackup(d, backup.Spec)
@@ -128,6 +131,19 @@ func DescribeResourcePolicies(d *Describer, resPolicies *corev1api.TypedLocalObj
 	d.Printf("Resource policies:\n")
 	d.Printf("\tType:\t%s\n", resPolicies.Kind)
 	d.Printf("\tName:\t%s\n", resPolicies.Name)
+}
+
+// DescribeGlobalVolumePolicy describes the cluster-wide global backup volume policies
+// ConfigMap that contributed to the backup, if any.
+func DescribeGlobalVolumePolicy(d *Describer, backup *velerov1api.Backup) {
+	name := backup.Annotations[velerov1api.GlobalBackupVolumePolicyConfigMapAnnotation]
+	if name == "" {
+		return
+	}
+	d.Println()
+	d.Printf("Global volume policies:\n")
+	d.Printf("\tType:\t%s\n", resourcepolicies.ConfigmapRefType)
+	d.Printf("\tName:\t%s\n", name)
 }
 
 // DescribeUploaderConfigForBackup describes uploader config in human-readable format
@@ -232,6 +248,10 @@ func DescribeBackupSpec(d *Describer, spec velerov1api.BackupSpec) {
 		s = spec.DataMover
 	}
 	d.Printf("Data Mover:\t%s\n", s)
+
+	if string(spec.BackupType) != "" {
+		d.Printf("Backup Type:\t%s\n", spec.BackupType)
+	}
 
 	d.Println()
 	d.Printf("TTL:\t%s\n", spec.TTL.Duration)
@@ -723,9 +743,17 @@ func describeDataMovement(d *Describer, details bool, info *volume.BackupVolumeI
 		d.Printf("\t\t\t\tData Mover: %s\n", dataMover)
 		d.Printf("\t\t\t\tUploader Type: %s\n", info.SnapshotDataMovementInfo.UploaderType)
 		d.Printf("\t\t\t\tMoved data Size (bytes): %d\n", info.SnapshotDataMovementInfo.Size)
-		if info.SnapshotDataMovementInfo.IncrementalSize > 0 {
-			d.Printf("\t\t\t\tIncremental data Size (bytes): %d\n", info.SnapshotDataMovementInfo.IncrementalSize)
+		// Print whenever the uploader measured a figure, including zero. A zero-delta
+		// incremental transfers nothing, which is the whole point of CBT; hiding it
+		// leaves only the volume size on display and makes the best possible result
+		// indistinguishable from a full transfer.
+		if info.SnapshotDataMovementInfo.IncrementalSize != nil {
+			d.Printf("\t\t\t\tIncremental data Size (bytes): %d\n", *info.SnapshotDataMovementInfo.IncrementalSize)
 		}
+		if info.SnapshotDataMovementInfo.ParentSnapshot != "" {
+			d.Printf("\t\t\t\tParent Snapshot: %s\n", info.SnapshotDataMovementInfo.ParentSnapshot)
+		}
+
 		d.Printf("\t\t\t\tResult: %s\n", info.Result)
 	} else {
 		d.Printf("\t\t\tData Movement: %s\n", "included, specify --details for more information")
@@ -899,7 +927,7 @@ type volumesByPod struct {
 // Add adds a pod volume with the specified pod namespace, name
 // and volume to the appropriate group.
 // Used for both backup and restore
-func (v *volumesByPod) Add(namespace, name, volume, phase string, progress veleroapishared.DataMoveOperationProgress, incrementalBytes int64) {
+func (v *volumesByPod) Add(namespace, name, volume, phase string, progress veleroapishared.DataMoveOperationProgress, incrementalBytes *int64) {
 	if v.volumesByPodMap == nil {
 		v.volumesByPodMap = make(map[string]*podVolumeGroup)
 	}
@@ -909,8 +937,12 @@ func (v *volumesByPod) Add(namespace, name, volume, phase string, progress veler
 	// append backup progress percentage if backup is in progress
 	if phase == "In Progress" && progress.TotalBytes != 0 {
 		volume = fmt.Sprintf("%s (%.2f%%)", volume, float64(progress.BytesDone)/float64(progress.TotalBytes)*100)
-	} else if phase == string(velerov1api.PodVolumeBackupPhaseCompleted) && incrementalBytes > 0 {
-		volume = fmt.Sprintf("%s (size: %v, incremental size: %v)", volume, progress.TotalBytes, incrementalBytes)
+	} else if phase == string(velerov1api.PodVolumeBackupPhaseCompleted) && incrementalBytes != nil {
+		// Report the incremental figure whenever it was measured, including zero. Zero is
+		// the best possible outcome - nothing changed, so nothing was transferred - and
+		// suppressing it leaves only the volume size on display, which reads as a full
+		// transfer.
+		volume = fmt.Sprintf("%s (size: %v, incremental size: %v)", volume, progress.TotalBytes, *incrementalBytes)
 	} else if (phase == string(velerov1api.PodVolumeBackupPhaseCompleted) ||
 		phase == string(velerov1api.PodVolumeRestorePhaseCompleted)) &&
 		progress.TotalBytes > 0 {
